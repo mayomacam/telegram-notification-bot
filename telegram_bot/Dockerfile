@@ -19,7 +19,8 @@ WORKDIR /app
 COPY --from=builder /root/.local /home/appuser/.local
 
 # Copy application code
-COPY telegram_bot/main.py .
+# COPY telegram_bot/main.py .
+COPY telegram_bot/main2.py .
 
 # Enforce ownership
 RUN chown -R appuser:appgroup /app
