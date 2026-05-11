@@ -35,4 +35,4 @@ ENV PYTHONUNBUFFERED=1
 EXPOSE 15005
 
 # Start the application
-CMD["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "15005"]
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "15005"]
