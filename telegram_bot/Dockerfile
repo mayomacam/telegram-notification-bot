@@ -2,7 +2,7 @@
 FROM python:3.11-slim AS builder
 
 WORKDIR /app
-COPY requirements.txt .
+COPY telegram_bot/requirements.txt .
 
 # Install dependencies into a local user directory
 RUN pip install --no-cache-dir --user -r requirements.txt
@@ -19,7 +19,7 @@ WORKDIR /app
 COPY --from=builder /root/.local /home/appuser/.local
 
 # Copy application code
-COPY main.py .
+COPY telegram_bot/main.py .
 
 # Enforce ownership
 RUN chown -R appuser:appgroup /app
