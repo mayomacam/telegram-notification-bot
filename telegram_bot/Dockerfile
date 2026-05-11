@@ -32,7 +32,7 @@ ENV PATH=/home/appuser/.local/bin:$PATH
 # Prevent python from buffering stdout/stderr (better logging)
 ENV PYTHONUNBUFFERED=1 
 
-EXPOSE 8000
+EXPOSE 15005
 
 # Start the application
-CMD["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "15005"]
