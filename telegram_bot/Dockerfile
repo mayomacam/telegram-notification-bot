@@ -19,8 +19,7 @@ WORKDIR /app
 COPY --from=builder /root/.local /home/appuser/.local
 
 # Copy application code
-# COPY telegram_bot/main.py .
-COPY telegram_bot/main2.py .
+COPY telegram_bot/main.py .
 
 # Enforce ownership
 RUN chown -R appuser:appgroup /app
@@ -36,4 +35,4 @@ ENV PYTHONUNBUFFERED=1
 EXPOSE 15005
 
 # Start the application
-CMD ["uvicorn", "main2:app", "--host", "0.0.0.0", "--port", "15005"]
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "15005"]
