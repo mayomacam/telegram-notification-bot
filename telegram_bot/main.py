@@ -3,15 +3,18 @@ import json
 import logging
 import secrets
 import time
-from datetime import datetime
+import uuid
+import contextvars
+from datetime import datetime, timezone
 from typing import Dict, Any, Optional
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, Depends, Security, Request
+from fastapi import FastAPI, HTTPException, Depends, Security, Request, Response
 from fastapi.security.api_key import APIKeyHeader
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, ORJSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
+from starlette.middleware.base import BaseHTTPMiddleware
 from pydantic import BaseModel, Field
 import httpx
 
@@ -28,10 +31,87 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 API_SECRET_KEY = os.getenv("API_SECRET_KEY")
 ALLOWED_HOSTS = os.getenv("ALLOWED_HOSTS", "*").split(",")
+ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*").split(",")
+RATE_LIMIT_REQUESTS = int(os.getenv("RATE_LIMIT_REQUESTS", "100"))
+RATE_LIMIT_WINDOW = int(os.getenv("RATE_LIMIT_WINDOW", "60"))
 
 if not all([TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, API_SECRET_KEY]):
     logger.error("CRITICAL: Missing required environment variables (TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, API_SECRET_KEY).")
     exit(1)
+
+# --- Logging Context Filter ---
+request_id_var = contextvars.ContextVar("request_id", default="n/a")
+
+class RequestIDFilter(logging.Filter):
+    def filter(self, record):
+        record.request_id = request_id_var.get()
+        return True
+
+# Update logging configuration to include request_id
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] [%(request_id)s] %(name)s: %(message)s",
+    datefmt="%Y-%m-%dT%H:%M:%SZ"
+)
+for handler in logging.root.handlers:
+    handler.addFilter(RequestIDFilter())
+
+# --- Security Middleware & Helpers ---
+class DebugMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        request_id = str(uuid.uuid4())
+        token = request_id_var.set(request_id)
+        start_time = time.time()
+
+        response = await call_next(request)
+
+        process_time = time.time() - start_time
+        metrics.add_request_time(process_time)
+        response.headers["X-Process-Time"] = f"{process_time:.4f}s"
+        response.headers["X-Request-ID"] = request_id
+
+        logger.info(f"Request {request.method} {request.url.path} processed in {process_time:.4f}s")
+        request_id_var.reset(token)
+        return response
+
+class SecurityHeadersMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        response = await call_next(request)
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+        response.headers["X-XSS-Protection"] = "1; mode=block"
+        response.headers["Content-Security-Policy"] = "default-src 'self'; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net;"
+        return response
+
+class RateLimiter:
+    def __init__(self, requests: int, window: int):
+        self.requests = requests
+        self.window = window
+        self.clients = {}
+
+    def is_allowed(self, client_ip: str) -> bool:
+        now = time.time()
+
+        # Prune old clients to prevent memory leak
+        if len(self.clients) > 1000: # Simple threshold to trigger pruning
+            expired_ips = [ip for ip, times in self.clients.items() if not times or now - times[-1] > self.window]
+            for ip in expired_ips:
+                del self.clients[ip]
+
+        if client_ip not in self.clients:
+            self.clients[client_ip] = [now]
+            return True
+
+        # Filter timestamps within the window
+        self.clients[client_ip] = [t for t in self.clients[client_ip] if now - t < self.window]
+
+        if len(self.clients[client_ip]) < self.requests:
+            self.clients[client_ip].append(now)
+            return True
+        return False
+
+rate_limiter = RateLimiter(RATE_LIMIT_REQUESTS, RATE_LIMIT_WINDOW)
 
 # --- Metrics Tracker ---
 class Metrics:
@@ -40,13 +120,38 @@ class Metrics:
         self.total_requests = 0
         self.successful_notifications = 0
         self.failed_notifications = 0
+        self.errors = 0
         self.last_notification_at: Optional[str] = None
+        self.request_times = []
 
     def get_uptime(self):
         delta = time.time() - self.start_time
         hours, rem = divmod(delta, 3600)
         minutes, seconds = divmod(rem, 60)
         return f"{int(hours)}h {int(minutes)}m {int(seconds)}s"
+
+    def __getitem__(self, key):
+        return getattr(self, key)
+
+    def __setitem__(self, key, value):
+        setattr(self, key, value)
+
+    def add_request_time(self, duration: float):
+        self.request_times.append((time.time(), duration))
+        # Keep only last hour of data for RPM/latency
+        self.request_times = [t for t in self.request_times if time.time() - t[0] < 3600]
+
+    def get_rpm(self):
+        now = time.time()
+        recent = [t for t in self.request_times if now - t[0] < 60]
+        return len(recent)
+
+    def get_avg_latency(self):
+        now = time.time()
+        recent = [t[1] for t in self.request_times if now - t[0] < 300]
+        if not recent:
+            return 0
+        return sum(recent) / len(recent)
 
 metrics = Metrics()
 
@@ -71,13 +176,16 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Secure Telegram Notification Gateway",
     version="2.0.0",
-    lifespan=lifespan
+    lifespan=lifespan,
+    default_response_class=ORJSONResponse
 )
 
 # --- Middlewares ---
+app.add_middleware(DebugMiddleware)
+app.add_middleware(SecurityHeadersMiddleware)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], # Adjust as needed for production
+    allow_origins=ALLOWED_ORIGINS,
     allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
@@ -102,42 +210,95 @@ async def verify_api_key(api_key: str = Security(api_key_header)):
 @app.get("/health")
 async def health_check():
     """Liveness and readiness probe."""
-    return {"status": "healthy", "timestamp": datetime.utcnow().isoformat()}
+    return {
+        "status": "healthy",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "uptime_seconds": int(time.time() - metrics.start_time)
+    }
 
 @app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard(api_key: str = Depends(verify_api_key)):
-    """A simple, lightweight monitoring dashboard."""
+    """A modern, lightweight monitoring dashboard."""
     html_content = f"""
     <!DOCTYPE html>
-    <html>
+    <html lang="en">
     <head>
-        <title>Gateway Monitor</title>
+        <meta charset="utf-8">
         <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta http-equiv="refresh" content="30">
+        <title>Gateway Dashboard</title>
+        <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@1/css/pico.min.css">
         <style>
-            body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; line-height: 1.6; color: #333; max-width: 800px; margin: 0 auto; padding: 20px; background-color: #f4f7f6; }}
-            .card {{ background: white; border-radius: 8px; padding: 20px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); margin-bottom: 20px; }}
-            h1 {{ color: #2c3e50; }}
-            .metric {{ display: flex; justify-content: space-between; border-bottom: 1px solid #eee; padding: 10px 0; }}
-            .metric:last-child {{ border-bottom: none; }}
-            .label {{ font-weight: bold; color: #7f8c8d; }}
-            .status-ok {{ color: #27ae60; font-weight: bold; }}
-            .status-err {{ color: #e74c3c; font-weight: bold; }}
+            :root {{ --primary: #0088cc; }}
+            body {{ padding-top: 2rem; }}
+            .status-ok {{ color: #27ae60; }}
+            .status-err {{ color: #e74c3c; }}
+            .grid {{ grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); }}
+            article {{ padding: 1.5rem; }}
+            header {{ font-weight: bold; font-size: 1.2rem; }}
         </style>
     </head>
     <body>
-        <h1>🚀 Gateway Monitor</h1>
-        <div class="card">
-            <div class="metric"><span class="label">Status</span><span class="status-ok">ONLINE</span></div>
-            <div class="metric"><span class="label">Uptime</span><span>{metrics.get_uptime()}</span></div>
-            <div class="metric"><span class="label">Total Requests</span><span>{metrics.total_requests}</span></div>
-        </div>
-        <div class="card">
-            <h2>Notifications</h2>
-            <div class="metric"><span class="label">Successful</span><span class="status-ok">{metrics.successful_notifications}</span></div>
-            <div class="metric"><span class="label">Failed</span><span class="status-err">{metrics.failed_notifications}</span></div>
-            <div class="metric"><span class="label">Last Notification</span><span>{metrics.last_notification_at or 'Never'}</span></div>
-        </div>
-        <p style="font-size: 0.8em; color: #95a5a6; text-align: center;">Secure Telegram Notification Gateway v2.0.0</p>
+        <main class="container">
+            <hgroup>
+                <h1>🚀 Gateway Dashboard</h1>
+                <h2>Real-time performance and health monitoring</h2>
+            </hgroup>
+
+            <div class="grid">
+                <article>
+                    <header>System Status</header>
+                    <div style="display: flex; justify-content: space-between;">
+                        <span>Status</span>
+                        <span class="status-ok">● ONLINE</span>
+                    </div>
+                    <div style="display: flex; justify-content: space-between;">
+                        <span>Uptime</span>
+                        <span>{metrics.get_uptime()}</span>
+                    </div>
+                    <div style="display: flex; justify-content: space-between;">
+                        <span>RPM</span>
+                        <span>{metrics.get_rpm()}</span>
+                    </div>
+                </article>
+
+                <article>
+                    <header>Traffic</header>
+                    <div style="display: flex; justify-content: space-between;">
+                        <span>Total Requests</span>
+                        <span>{metrics.total_requests}</span>
+                    </div>
+                    <div style="display: flex; justify-content: space-between;">
+                        <span>Avg Latency</span>
+                        <span>{metrics.get_avg_latency():.3f}s</span>
+                    </div>
+                    <div style="display: flex; justify-content: space-between;">
+                        <span>Auth Errors</span>
+                        <span class="{"status-err" if metrics.errors > 0 else "" }">{metrics.errors}</span>
+                    </div>
+                </article>
+
+                <article>
+                    <header>Notifications</header>
+                    <div style="display: flex; justify-content: space-between;">
+                        <span>Successful</span>
+                        <span class="status-ok">{metrics.successful_notifications}</span>
+                    </div>
+                    <div style="display: flex; justify-content: space-between;">
+                        <span>Failed</span>
+                        <span class="{"status-err" if metrics.failed_notifications > 0 else "" }">{metrics.failed_notifications}</span>
+                    </div>
+                    <div style="display: flex; justify-content: space-between;">
+                        <span>Last Dispatch</span>
+                        <small>{metrics.last_notification_at or 'Never'}</small>
+                    </div>
+                </article>
+            </div>
+
+            <footer style="margin-top: 2rem; text-align: center;">
+                <small>Secure Telegram Notification Gateway v2.0.0 • Auto-refreshes every 30s</small>
+            </footer>
+        </main>
     </body>
     </html>
     """
@@ -150,6 +311,11 @@ async def send_notification(
     api_key: str = Depends(verify_api_key)
 ):
     """Receives webhooks and forwards them to Telegram securely."""
+    client_ip = request.client.host if request.client else "unknown"
+    if not rate_limiter.is_allowed(client_ip):
+        logger.warning(f"Rate limit exceeded for {client_ip}")
+        raise HTTPException(status_code=429, detail="Rate limit exceeded")
+
     metrics.total_requests += 1
 
     # Payload processing
@@ -171,21 +337,26 @@ async def send_notification(
         "parse_mode": "HTML"
     }
     
+    start_dispatch = time.time()
     try:
         client: httpx.AsyncClient = request.app.state.http_client
         response = await client.post(telegram_url, json=data)
+        dispatch_latency = time.time() - start_dispatch
+        logger.info(f"Telegram API response latency: {dispatch_latency:.4f}s")
         response.raise_for_status()
 
         metrics.successful_notifications += 1
-        metrics.last_notification_at = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+        metrics.last_notification_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
         logger.info(f"Notification successfully dispatched from {request.client.host if request.client else 'unknown'}")
         return {"status": "success", "message": "Dispatched"}
             
     except httpx.HTTPStatusError as e:
         metrics.failed_notifications += 1
+        metrics.errors += 1
         logger.error(f"Telegram API Error: {e.response.status_code} - {e.response.text}")
         raise HTTPException(status_code=502, detail=f"Upstream Telegram error: {e.response.status_code}")
     except Exception as e:
         metrics.failed_notifications += 1
+        metrics.errors += 1
         logger.exception("Internal Server Error during dispatch.")
         raise HTTPException(status_code=500, detail="Internal processing error")
