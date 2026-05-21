@@ -1,8 +1,8 @@
 import os
 import json
 import logging
-import time
 import secrets
+import time
 from datetime import datetime
 from typing import Dict, Any, Optional
 from contextlib import asynccontextmanager
@@ -23,6 +23,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("telegram_gateway")
 
+# 2. Secure Configuration via Environment Variables
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 API_SECRET_KEY = os.getenv("API_SECRET_KEY")
@@ -92,6 +93,7 @@ async def verify_api_key(api_key: str = Security(api_key_header)):
     # Use secrets.compare_digest to prevent timing attacks
     if not secrets.compare_digest(api_key, API_SECRET_KEY):
         logger.warning("Security Alert: Unauthorized access attempt blocked.")
+        metrics["errors"] += 1
         raise HTTPException(status_code=403, detail="Unauthorized")
     return api_key
 
