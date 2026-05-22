@@ -1,0 +1,14 @@
+INFO:     Started server process [104211]
+INFO:     Waiting for application startup.
+2026-05-21T23:26:32Z [INFO] telegram_gateway: Gateway started, HTTP client initialized.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:15005 (Press CTRL+C to quit)
+2026-05-21T23:26:35Z [INFO] telegram_gateway: Request GET /health processed in 0.0008s
+INFO:     127.0.0.1:54500 - "GET /health HTTP/1.1" 200 OK
+2026-05-21T23:27:35Z [INFO] telegram_gateway: Request GET /dashboard processed in 0.0007s
+INFO:     127.0.0.1:53724 - "GET /dashboard HTTP/1.1" 200 OK
+INFO:     Shutting down
+INFO:     Waiting for application shutdown.
+2026-05-21T23:28:22Z [INFO] telegram_gateway: Gateway shutting down, HTTP client closed.
+INFO:     Application shutdown complete.
+INFO:     Finished server process [104211]
