@@ -35,10 +35,10 @@ def test_unauthorized_access():
 def test_dashboard_authorized():
     response = client.get("/dashboard", headers={"X-API-Key": "test_secret_key"})
     assert response.status_code == 200
-    assert "Gateway Dashboard" in response.text
-    assert "ONLINE" in response.text
+    assert "Sentinel Monitor" in response.text
+    assert "ACTIVE" in response.text
     assert "pico.min.css" in response.text
-    assert "RPM" in response.text
+    assert "Throughput" in response.text
     assert "Avg Latency" in response.text
 
 @pytest.mark.asyncio
