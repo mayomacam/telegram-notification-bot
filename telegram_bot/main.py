@@ -18,6 +18,7 @@ from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
 from pydantic import BaseModel, Field
 import httpx
+import psutil
 
 # --- Configuration & Logging ---
 logging.basicConfig(
@@ -65,6 +66,9 @@ class DebugMiddleware(BaseHTTPMiddleware):
         token = request_id_var.set(request_id)
         start_time = time.time()
 
+        user_agent = request.headers.get("user-agent", "unknown")
+        x_forwarded = request.headers.get("x-forwarded-for", "none")
+
         response = await call_next(request)
 
         process_time = time.time() - start_time
@@ -72,7 +76,10 @@ class DebugMiddleware(BaseHTTPMiddleware):
         response.headers["X-Process-Time"] = f"{process_time:.4f}s"
         response.headers["X-Request-ID"] = request_id
 
-        logger.info(f"Request {request.method} {request.url.path} processed in {process_time:.4f}s")
+        logger.info(
+            f"Request {request.method} {request.url.path} processed in {process_time:.4f}s | "
+            f"UA: {user_agent} | XFF: {x_forwarded}"
+        )
         request_id_var.reset(token)
         return response
 
@@ -82,7 +89,7 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["X-Frame-Options"] = "DENY"
         response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
-        response.headers["X-XSS-Protection"] = "0"  # Modern recommendation is to disable it and use CSP
+        response.headers["X-XSS-Protection"] = "0"
         response.headers["Content-Security-Policy"] = (
             "default-src 'self'; "
             "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
@@ -94,9 +101,52 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         )
         response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
         response.headers["Permissions-Policy"] = "geolocation=(), microphone=(), camera=()"
+        response.headers["X-Permitted-Cross-Domain-Policies"] = "none"
+        response.headers["Cross-Origin-Opener-Policy"] = "same-origin"
         return response
 
+class SecuritySentinel:
+    __slots__ = ("events", "blacklist", "blacklist_duration")
+
+    def __init__(self, blacklist_duration: int = 3600):
+        self.events = deque(maxlen=50)  # Store last 50 events
+        self.blacklist: Dict[str, float] = {}
+        self.blacklist_duration = blacklist_duration
+
+    def log_event(self, ip: str, event_type: str, details: str):
+        timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        self.events.append({
+            "timestamp": timestamp,
+            "ip": ip,
+            "type": event_type,
+            "details": details
+        })
+
+        # If it's a security violation, consider blacklisting
+        if event_type in ("AUTH_FAILURE", "RATE_LIMIT"):
+            self._check_blacklist(ip)
+
+    def _check_blacklist(self, ip: str):
+        # Very simple logic: if 5 failures in 5 minutes, blacklist for 1 hour
+        now = time.monotonic()
+        recent_failures = [e for e in self.events if e["ip"] == ip and e["type"] in ("AUTH_FAILURE", "RATE_LIMIT")]
+        if len(recent_failures) >= 5:
+            self.blacklist[ip] = now + self.blacklist_duration
+            logger.warning(f"IP {ip} has been temporarily blacklisted due to multiple security events.")
+
+    def is_blacklisted(self, ip: str) -> bool:
+        if ip in self.blacklist:
+            if time.monotonic() < self.blacklist[ip]:
+                return True
+            else:
+                del self.blacklist[ip]
+        return False
+
+sentinel = SecuritySentinel()
+
 class RateLimiter:
+    __slots__ = ("requests", "window", "clients", "_last_prune")
+
     def __init__(self, requests: int, window: int):
         self.requests = requests
         self.window = window
@@ -131,12 +181,18 @@ rate_limiter = RateLimiter(RATE_LIMIT_REQUESTS, RATE_LIMIT_WINDOW)
 
 # --- Metrics Tracker ---
 class Metrics:
+    __slots__ = (
+        "start_time", "total_requests", "successful_notifications",
+        "failed_notifications", "errors", "security_blocks", "last_notification_at", "request_times"
+    )
+
     def __init__(self):
         self.start_time = time.time()
         self.total_requests = 0
         self.successful_notifications = 0
         self.failed_notifications = 0
         self.errors = 0
+        self.security_blocks = 0
         self.last_notification_at: Optional[str] = None
         self.request_times = deque() # (timestamp, duration)
 
@@ -231,18 +287,27 @@ async def verify_api_key(
     request: Request,
     api_key_header: Optional[str] = Security(api_key_header)
 ):
+    client_ip = request.client.host if request.client else "unknown"
+
+    if sentinel.is_blacklisted(client_ip):
+        logger.warning(f"Security Alert: Blocked request from blacklisted IP {client_ip}")
+        metrics.security_blocks += 1
+        raise HTTPException(status_code=403, detail="IP temporarily blacklisted")
+
     # Check header first, then query parameter
     api_key = api_key_header or request.query_params.get("api_key")
 
     if not api_key:
-        logger.warning("Security Alert: API Key missing.")
-        metrics.errors += 1
+        logger.warning(f"Security Alert: API Key missing from {client_ip}")
+        metrics.security_blocks += 1
+        sentinel.log_event(client_ip, "AUTH_FAILURE", "Missing API Key")
         raise HTTPException(status_code=403, detail="API Key missing")
 
     # Use secrets.compare_digest to prevent timing attacks
     if not secrets.compare_digest(api_key, API_SECRET_KEY):
-        logger.warning("Security Alert: Unauthorized access attempt blocked.")
-        metrics.errors += 1
+        logger.warning(f"Security Alert: Unauthorized access attempt blocked from {client_ip}")
+        metrics.security_blocks += 1
+        sentinel.log_event(client_ip, "AUTH_FAILURE", "Invalid API Key")
         raise HTTPException(status_code=403, detail="Unauthorized")
     return api_key
 
@@ -259,7 +324,22 @@ async def health_check():
 
 @app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard(api_key: str = Depends(verify_api_key)):
-    """A modern, lightweight monitoring dashboard."""
+    """A modern, high-security monitoring dashboard."""
+    cpu_usage = psutil.cpu_percent()
+    memory = psutil.virtual_memory()
+    memory_usage = memory.percent
+
+    events_html = "".join([
+        f"<tr><td>{e['timestamp']}</td><td><code>{e['ip']}</code></td><td><mark>{e['type']}</mark></td><td>{e['details']}</td></tr>"
+        for e in reversed(sentinel.events)
+    ]) or "<tr><td colspan='4' style='text-align:center;'>No security events recorded</td></tr>"
+
+    try:
+        sys_info = f"{os.uname().sysname} {os.uname().release}"
+    except AttributeError:
+        import platform
+        sys_info = f"{platform.system()} {platform.release()}"
+
     html_content = f"""
     <!DOCTYPE html>
     <html lang="en" data-theme="dark">
@@ -267,105 +347,126 @@ async def dashboard(api_key: str = Depends(verify_api_key)):
         <meta charset="utf-8">
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <meta http-equiv="refresh" content="30">
-        <title>Gateway Dashboard</title>
+        <title>Sentinel Dashboard</title>
         <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
         <style>
             :root {{
-                --pico-primary: #0088cc;
-                --pico-primary-hover: #0077b3;
-                --pico-primary-focus: rgba(0, 136, 204, 0.25);
+                --pico-primary: #00d1b2;
+                --pico-primary-hover: #00b89c;
+                --pico-background-color: #0a0b10;
+                --pico-card-background-color: #14161f;
             }}
-            body {{ padding: 2rem 0; }}
-            .status-ok {{ color: #2ecc71; }}
-            .status-err {{ color: #e74c3c; }}
+            body {{ padding: 2rem 0; background-color: var(--pico-background-color); }}
+            .status-ok {{ color: #00d1b2; }}
+            .status-err {{ color: #ff3860; font-weight: bold; }}
             .metric-card {{
-                padding: 1rem;
-                border-radius: 8px;
-                background: var(--pico-card-background-color);
-                box-shadow: var(--pico-card-box-shadow);
+                padding: 1.25rem;
+                border-radius: 12px;
+                border: 1px solid #232632;
             }}
             .metric-value {{
-                font-size: 1.5rem;
-                font-weight: bold;
+                font-size: 1.75rem;
+                font-weight: 800;
                 display: block;
                 margin-top: 0.5rem;
+                font-family: monospace;
             }}
-            .grid {{
-                display: grid;
-                grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-                gap: 1rem;
-                margin-bottom: 2rem;
-            }}
-            header {{ margin-bottom: 2rem; }}
+            .grid {{ margin-bottom: 2rem; }}
+            header {{ margin-bottom: 3rem; border-bottom: 1px solid #232632; padding-bottom: 2rem; }}
+            table {{ font-size: 0.9rem; }}
+            mark {{ background: #232632; color: #ff3860; border: 1px solid #ff3860; }}
+            code {{ background: #1a1c27; }}
+            .progress-container {{ height: 8px; background: #232632; border-radius: 4px; margin-top: 10px; }}
+            .progress-bar {{ height: 100%; border-radius: 4px; background: var(--pico-primary); transition: width 0.5s; }}
         </style>
     </head>
     <body>
         <main class="container">
             <header>
                 <hgroup>
-                    <h1>🛡️ Gateway Sentinel</h1>
-                    <p>Secure Telegram Notification Gateway v2.1.0</p>
+                    <h1 style="display:flex; align-items:center; gap:10px;">
+                        <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="status-ok"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path></svg>
+                        SENTINEL MONITOR
+                    </h1>
+                    <p>Advanced Security Gateway • v2.2.0 • System: {sys_info}</p>
                 </hgroup>
             </header>
 
             <section>
-                <h2>System Health</h2>
                 <div class="grid">
                     <article class="metric-card">
-                        <small>Status</small>
-                        <span class="metric-value status-ok">● ONLINE</span>
+                        <small>CPU USAGE</small>
+                        <span class="metric-value">{cpu_usage}%</span>
+                        <div class="progress-container"><div class="progress-bar" style="width: {cpu_usage}%;"></div></div>
                     </article>
                     <article class="metric-card">
-                        <small>Uptime</small>
+                        <small>RAM USAGE</small>
+                        <span class="metric-value">{memory_usage}%</span>
+                        <div class="progress-container"><div class="progress-bar" style="width: {memory_usage}%;"></div></div>
+                    </article>
+                    <article class="metric-card">
+                        <small>UPTIME</small>
                         <span class="metric-value">{metrics.get_uptime()}</span>
-                    </article>
-                    <article class="metric-card">
-                        <small>Throughput (RPM)</small>
-                        <span class="metric-value">{metrics.get_rpm()}</span>
-                    </article>
-                    <article class="metric-card">
-                        <small>Avg Latency</small>
-                        <span class="metric-value">{metrics.get_avg_latency():.3f}s</span>
                     </article>
                 </div>
             </section>
 
             <section>
-                <h2>Traffic & Security</h2>
+                <h3>Security & Traffic</h3>
                 <div class="grid">
                     <article class="metric-card">
-                        <small>Total Requests</small>
+                        <small>THROUGHPUT (RPM)</small>
+                        <span class="metric-value">{metrics.get_rpm()}</span>
+                    </article>
+                    <article class="metric-card">
+                        <small>AVG LATENCY</small>
+                        <span class="metric-value status-ok">{metrics.get_avg_latency():.3f}s</span>
+                    </article>
+                    <article class="metric-card">
+                        <small>SECURITY BLOCKS</small>
+                        <span class="metric-value {"status-err" if metrics.security_blocks > 0 else "" }">{metrics.security_blocks}</span>
+                    </article>
+                </div>
+                <div class="grid">
+                    <article class="metric-card">
+                        <small>TOTAL REQUESTS</small>
                         <span class="metric-value">{metrics.total_requests}</span>
                     </article>
                     <article class="metric-card">
-                        <small>Auth/IP Blocked</small>
-                        <span class="metric-value {"status-err" if metrics.errors > 0 else "" }">{metrics.errors}</span>
-                    </article>
-                    <article class="metric-card">
-                        <small>Successful Dispatches</small>
+                        <small>DISPATCH SUCCESS</small>
                         <span class="metric-value status-ok">{metrics.successful_notifications}</span>
                     </article>
                     <article class="metric-card">
-                        <small>Failed Dispatches</small>
+                        <small>DISPATCH FAILURES</small>
                         <span class="metric-value {"status-err" if metrics.failed_notifications > 0 else "" }">{metrics.failed_notifications}</span>
                     </article>
                 </div>
             </section>
 
             <section>
-                <h2>Recent Activity</h2>
-                <article>
-                    <div style="display: flex; justify-content: space-between; align-items: center;">
-                        <span>Last Successful Dispatch:</span>
-                        <mark>{metrics.last_notification_at or 'Never'}</mark>
-                    </div>
-                </article>
+                <h3>Recent Security Events</h3>
+                <figure>
+                    <table role="grid">
+                        <thead>
+                            <tr>
+                                <th>Timestamp</th>
+                                <th>Source IP</th>
+                                <th>Event Type</th>
+                                <th>Details</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {events_html}
+                        </tbody>
+                    </table>
+                </figure>
             </section>
 
-            <footer style="margin-top: 4rem; text-align: center; border-top: 1px solid var(--pico-muted-border-color); padding-top: 2rem;">
+            <footer style="margin-top: 4rem; text-align: center; color: #666; padding-top: 2rem;">
                 <small>
                     Refreshes automatically every 30s •
-                    IP Allowlist: <code>{"Active" if IP_ALLOWLIST else "Disabled"}</code>
+                    IP Allowlist: <code>{"Active" if IP_ALLOWLIST else "Disabled"}</code> •
+                    Blacklisted IPs: <code>{len(sentinel.blacklist)}</code>
                 </small>
             </footer>
         </main>
@@ -386,11 +487,14 @@ async def send_notification(
     # IP Allowlist check
     if IP_ALLOWLIST and client_ip not in IP_ALLOWLIST:
         logger.warning(f"Access denied for IP: {client_ip}")
-        metrics.errors += 1
+        metrics.security_blocks += 1
+        sentinel.log_event(client_ip, "IP_BLOCKED", "IP not in allowlist")
         raise HTTPException(status_code=403, detail="IP not allowed")
 
     if not rate_limiter.is_allowed(client_ip):
         logger.warning(f"Rate limit exceeded for {client_ip}")
+        metrics.security_blocks += 1
+        sentinel.log_event(client_ip, "RATE_LIMIT", "Rate limit exceeded")
         raise HTTPException(status_code=429, detail="Rate limit exceeded")
 
     metrics.total_requests += 1
@@ -434,7 +538,8 @@ async def send_notification(
     except httpx.HTTPStatusError as e:
         metrics.failed_notifications += 1
         metrics.errors += 1
-        logger.error(f"Telegram API Error: {e.response.status_code} - {e.response.text}")
+        error_body = e.response.text[:100]
+        logger.error(f"Telegram API Error: Status {e.response.status_code} | Body: {error_body}...")
         raise HTTPException(status_code=502, detail=f"Upstream Telegram error: {e.response.status_code}")
     except Exception as e:
         metrics.failed_notifications += 1

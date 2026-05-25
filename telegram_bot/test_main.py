@@ -35,11 +35,11 @@ def test_unauthorized_access():
 def test_dashboard_authorized():
     response = client.get("/dashboard", headers={"X-API-Key": "test_secret_key"})
     assert response.status_code == 200
-    assert "Gateway Dashboard" in response.text
-    assert "ONLINE" in response.text
+    assert "Sentinel Dashboard" in response.text
+    assert "SENTINEL MONITOR" in response.text
     assert "pico.min.css" in response.text
-    assert "RPM" in response.text
-    assert "Avg Latency" in response.text
+    assert "THROUGHPUT" in response.text
+    assert "AVG LATENCY" in response.text
 
 @pytest.mark.asyncio
 async def test_notify_success():
@@ -96,6 +96,8 @@ def test_security_headers():
     assert "Strict-Transport-Security" in response.headers
     assert "X-Request-ID" in response.headers
     assert "X-Process-Time" in response.headers
+    assert response.headers["X-Permitted-Cross-Domain-Policies"] == "none"
+    assert response.headers["Cross-Origin-Opener-Policy"] == "same-origin"
 
 def test_rate_limiting():
     # Set a very low rate limit for testing
