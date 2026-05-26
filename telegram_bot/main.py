@@ -5,6 +5,7 @@ import secrets
 import time
 import uuid
 import contextvars
+from collections import deque
 from datetime import datetime, timezone
 from typing import Dict, Any, Optional
 from contextlib import asynccontextmanager
@@ -63,17 +64,23 @@ class DebugMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         request_id = str(uuid.uuid4())
         token = request_id_var.set(request_id)
-        start_time = time.time()
+        start_time = time.monotonic()
 
-        response = await call_next(request)
+        try:
+            response = await call_next(request)
+            process_time = time.monotonic() - start_time
+        except Exception as e:
+            process_time = time.monotonic() - start_time
+            logger.error(f"Request {request.method} {request.url.path} failed after {process_time:.4f}s: {e}")
+            raise
+        finally:
+            metrics.add_request_time(process_time)
+            request_id_var.reset(token)
 
-        process_time = time.time() - start_time
-        metrics.add_request_time(process_time)
         response.headers["X-Process-Time"] = f"{process_time:.4f}s"
         response.headers["X-Request-ID"] = request_id
 
         logger.info(f"Request {request.method} {request.url.path} processed in {process_time:.4f}s")
-        request_id_var.reset(token)
         return response
 
 class SecurityHeadersMiddleware(BaseHTTPMiddleware):
@@ -97,6 +104,7 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         return response
 
 class RateLimiter:
+    __slots__ = ("requests", "window", "clients")
     def __init__(self, requests: int, window: int):
         self.requests = requests
         self.window = window
@@ -131,8 +139,10 @@ rate_limiter = RateLimiter(RATE_LIMIT_REQUESTS, RATE_LIMIT_WINDOW)
 
 # --- Metrics Tracker ---
 class Metrics:
+    __slots__ = ("start_time", "total_requests", "successful_notifications",
+                 "failed_notifications", "errors", "last_notification_at", "request_times")
     def __init__(self):
-        self.start_time = time.time()
+        self.start_time = time.monotonic()
         self.total_requests = 0
         self.successful_notifications = 0
         self.failed_notifications = 0
@@ -141,7 +151,7 @@ class Metrics:
         self.request_times = deque() # (timestamp, duration)
 
     def get_uptime(self):
-        delta = time.time() - self.start_time
+        delta = time.monotonic() - self.start_time
         hours, rem = divmod(delta, 3600)
         minutes, seconds = divmod(rem, 60)
         return f"{int(hours)}h {int(minutes)}m {int(seconds)}s"
@@ -254,11 +264,17 @@ async def health_check():
     return {
         "status": "healthy",
         "timestamp": datetime.now(timezone.utc).isoformat(),
-        "uptime_seconds": int(time.time() - metrics.start_time)
+        "uptime_seconds": int(time.monotonic() - metrics.start_time),
+        "metrics": {
+            "total_requests": metrics.total_requests,
+            "rpm": metrics.get_rpm(),
+            "avg_latency_ms": round(metrics.get_avg_latency() * 1000, 2),
+            "security_errors": metrics.errors
+        }
     }
 
 @app.get("/dashboard", response_class=HTMLResponse)
-async def dashboard(api_key: str = Depends(verify_api_key)):
+async def dashboard(api_key: str = Depends(verify_security)):
     """A modern, lightweight monitoring dashboard."""
     html_content = f"""
     <!DOCTYPE html>
@@ -369,6 +385,14 @@ async def dashboard(api_key: str = Depends(verify_api_key)):
                 </small>
             </footer>
         </main>
+        <script>
+            let timeLeft = 30;
+            setInterval(() => {{
+                timeLeft--;
+                if (timeLeft < 0) timeLeft = 30;
+                document.getElementById('timer').innerText = timeLeft;
+            }}, 1000);
+        </script>
     </body>
     </html>
     """
@@ -378,7 +402,7 @@ async def dashboard(api_key: str = Depends(verify_api_key)):
 async def send_notification(
     request: Request,
     payload: NotificationPayload,
-    api_key: str = Depends(verify_api_key)
+    api_key: str = Depends(verify_security)
 ):
     """Receives webhooks and forwards them to Telegram securely."""
     client_ip = request.client.host if request.client else "unknown"
@@ -418,11 +442,11 @@ async def send_notification(
         "parse_mode": "HTML"
     }
     
-    start_dispatch = time.time()
+    start_dispatch = time.monotonic()
     try:
         client: httpx.AsyncClient = request.app.state.http_client
         response = await client.post(telegram_url, json=data)
-        dispatch_latency = time.time() - start_dispatch
+        dispatch_latency = time.monotonic() - start_dispatch
         logger.info(f"Telegram API response latency: {dispatch_latency:.4f}s")
         response.raise_for_status()
 
