@@ -254,13 +254,14 @@ async def verify_api_key(
         logger.warning("Security Alert: Unauthorized access attempt blocked.")
         metrics.errors += 1
         raise HTTPException(status_code=403, detail="Unauthorized")
+
     return api_key
 
 # --- Routes ---
 
 @app.get("/health")
 async def health_check():
-    """Liveness and readiness probe."""
+    """Liveness and readiness probe with enriched metrics."""
     return {
         "status": "healthy",
         "timestamp": datetime.now(timezone.utc).isoformat(),
