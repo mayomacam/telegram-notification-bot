@@ -38,8 +38,8 @@ def test_dashboard_authorized():
     assert "Sentinel Monitor" in response.text
     assert "ACTIVE" in response.text
     assert "pico.min.css" in response.text
-    assert "Throughput" in response.text
-    assert "Avg Latency" in response.text
+    assert "RPM" in response.text
+    assert "Latency" in response.text
 
 @pytest.mark.asyncio
 async def test_notify_success():
