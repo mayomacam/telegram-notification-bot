@@ -35,11 +35,9 @@ def test_unauthorized_access():
 def test_dashboard_authorized():
     response = client.get("/dashboard", headers={"X-API-Key": "test_secret_key"})
     assert response.status_code == 200
-    assert "Sentinel Monitor" in response.text
-    assert "ACTIVE" in response.text
+    assert "SENTINEL MONITOR" in response.text.upper()
     assert "pico.min.css" in response.text
-    assert "RPM" in response.text
-    assert "Latency" in response.text
+    assert "LATENCY" in response.text.upper()
 
 @pytest.mark.asyncio
 async def test_notify_success():

@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from typing import Dict, Any, Optional
 from contextlib import asynccontextmanager
 from collections import deque
+import platform
 
 from fastapi import FastAPI, HTTPException, Depends, Security, Request, Response
 from fastapi.security.api_key import APIKeyHeader
@@ -17,7 +18,7 @@ from fastapi.responses import HTMLResponse, ORJSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 import httpx
 import psutil
 
@@ -67,12 +68,15 @@ class DebugMiddleware(BaseHTTPMiddleware):
         token = request_id_var.set(request_id)
         start_time = time.monotonic()
 
+        user_agent = request.headers.get("user-agent", "unknown")
+        x_forwarded_for = request.headers.get("x-forwarded-for", "none")
+
         try:
             response = await call_next(request)
             process_time = time.monotonic() - start_time
         except Exception as e:
             process_time = time.monotonic() - start_time
-            logger.error(f"Request {request.method} {request.url.path} failed after {process_time:.4f}s: {e}")
+            logger.error(f"Request {request.method} {request.url.path} from {request.client.host if request.client else 'unknown'} (UA: {user_agent}, XFF: {x_forwarded_for}) failed after {process_time:.4f}s: {e}")
             raise
         finally:
             metrics.add_request_time(process_time)
@@ -81,7 +85,7 @@ class DebugMiddleware(BaseHTTPMiddleware):
         response.headers["X-Process-Time"] = f"{process_time:.4f}s"
         response.headers["X-Request-ID"] = request_id
 
-        logger.info(f"Request {request.method} {request.url.path} processed in {process_time:.4f}s")
+        logger.info(f"Request {request.method} {request.url.path} from {request.client.host if request.client else 'unknown'} (UA: {user_agent}, XFF: {x_forwarded_for}) processed in {process_time:.4f}s")
         return response
 
 class SecurityHeadersMiddleware(BaseHTTPMiddleware):
@@ -146,7 +150,7 @@ class SecuritySentinel:
 sentinel = SecuritySentinel()
 
 class RateLimiter:
-    __slots__ = ("requests", "window", "clients")
+    __slots__ = ("requests", "window", "clients", "_last_prune")
     def __init__(self, requests: int, window: int):
         self.requests = requests
         self.window = window
@@ -182,7 +186,7 @@ rate_limiter = RateLimiter(RATE_LIMIT_REQUESTS, RATE_LIMIT_WINDOW)
 # --- Metrics Tracker ---
 class Metrics:
     __slots__ = ("start_time", "total_requests", "successful_notifications",
-                 "failed_notifications", "errors", "last_notification_at", "request_times")
+                 "failed_notifications", "errors", "security_blocks", "last_notification_at", "request_times")
     def __init__(self):
         self.start_time = time.monotonic()
         self.total_requests = 0
@@ -239,10 +243,8 @@ metrics = Metrics()
 
 # --- Models ---
 class NotificationPayload(BaseModel):
+    model_config = ConfigDict(extra="allow")
     message: Optional[str] = Field(None, description="The message to send. If missing, the whole payload is sent as JSON.")
-
-    class Config:
-        extra = "allow"
 
 # --- Lifespan Management ---
 @asynccontextmanager
@@ -280,7 +282,7 @@ app.add_middleware(
 # --- Security ---
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
-async def verify_api_key(
+async def verify_security(
     request: Request,
     api_key_header: Optional[str] = Security(api_key_header)
 ):
@@ -293,6 +295,11 @@ async def verify_api_key(
 
     # Check header first, then query parameter
     api_key = api_key_header or request.query_params.get("api_key")
+
+    if api_key:
+        # Log partial key for debugging (first 4 chars)
+        masked_key = api_key[:4] + "****" if len(api_key) > 4 else "****"
+        logger.debug(f"Verifying API key: {masked_key} from {client_ip}")
 
     if not api_key:
         logger.warning(f"Security Alert: API Key missing from {client_ip}")
@@ -329,6 +336,21 @@ async def health_check():
 @app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard(api_key: str = Depends(verify_security)):
     """A modern, lightweight monitoring dashboard."""
+    cpu_usage = psutil.cpu_percent(interval=None)
+    memory_usage = psutil.virtual_memory().percent
+    sys_info = f"{platform.system()} {platform.release()}"
+
+    events_html = ""
+    for event in reversed(sentinel.events):
+        events_html += f"""
+        <tr>
+            <td>{event['timestamp']}</td>
+            <td><code>{event['ip']}</code></td>
+            <td><mark>{event['type']}</mark></td>
+            <td>{event['details']}</td>
+        </tr>
+        """
+
     html_content = f"""
     <!DOCTYPE html>
     <html lang="en" data-theme="dark">
@@ -401,8 +423,12 @@ async def dashboard(api_key: str = Depends(verify_security)):
             </section>
 
             <section>
-                <h3>Security & Traffic</h3>
+                <h3>Traffic Metrics</h3>
                 <div class="grid">
+                    <article class="metric-card">
+                        <small>TOTAL REQUESTS</small>
+                        <span class="metric-value">{metrics.total_requests}</span>
+                    </article>
                     <article class="metric-card">
                         <small>THROUGHPUT (RPM)</small>
                         <span class="metric-value">{metrics.get_rpm()}</span>
@@ -411,16 +437,8 @@ async def dashboard(api_key: str = Depends(verify_security)):
                         <small>AVG LATENCY</small>
                         <span class="metric-value status-ok">{metrics.get_avg_latency():.3f}s</span>
                     </article>
-                    <article class="metric-card">
-                        <small>SECURITY BLOCKS</small>
-                        <span class="metric-value {"status-err" if metrics.security_blocks > 0 else "" }">{metrics.security_blocks}</span>
-                    </article>
                 </div>
                 <div class="grid">
-                    <article class="metric-card">
-                        <small>TOTAL REQUESTS</small>
-                        <span class="metric-value">{metrics.total_requests}</span>
-                    </article>
                     <article class="metric-card">
                         <small>DISPATCH SUCCESS</small>
                         <span class="metric-value status-ok">{metrics.successful_notifications}</span>
@@ -429,14 +447,18 @@ async def dashboard(api_key: str = Depends(verify_security)):
                         <small>DISPATCH FAILURES</small>
                         <span class="metric-value {"status-err" if metrics.failed_notifications > 0 else "" }">{metrics.failed_notifications}</span>
                     </article>
+                    <article class="metric-card">
+                        <small>SECURITY BLOCKS</small>
+                        <span class="metric-value {"status-err" if metrics.security_blocks > 0 else "" }">{metrics.security_blocks}</span>
+                    </article>
                 </div>
             </section>
 
             <section>
                 <h3>Recent Security Events</h3>
-                <figure>
+                <figure style="overflow-x: auto; max-height: 400px; overflow-y: auto;">
                     <table role="grid">
-                        <thead>
+                        <thead style="position: sticky; top: 0; background: var(--pico-card-background-color); z-index: 1;">
                             <tr>
                                 <th>Timestamp</th>
                                 <th>Source IP</th>
@@ -445,7 +467,7 @@ async def dashboard(api_key: str = Depends(verify_security)):
                             </tr>
                         </thead>
                         <tbody>
-                            {events_html}
+                            {events_html if events_html else "<tr><td colspan='4' style='text-align:center;'>No security events recorded.</td></tr>"}
                         </tbody>
                     </table>
                 </figure>
@@ -453,7 +475,7 @@ async def dashboard(api_key: str = Depends(verify_security)):
 
             <footer style="margin-top: 4rem; text-align: center; color: #666; padding-top: 2rem;">
                 <small>
-                    Refreshes automatically every 30s •
+                    Refreshes automatically in <span id="timer">30</span>s •
                     IP Allowlist: <code>{"Active" if IP_ALLOWLIST else "Disabled"}</code> •
                     Blacklisted IPs: <code>{len(sentinel.blacklist)}</code>
                 </small>
