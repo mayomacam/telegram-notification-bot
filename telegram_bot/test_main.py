@@ -96,6 +96,8 @@ def test_security_headers():
     assert "Strict-Transport-Security" in response.headers
     assert "X-Request-ID" in response.headers
     assert "X-Process-Time" in response.headers
+    assert response.headers["X-Permitted-Cross-Domain-Policies"] == "none"
+    assert response.headers["Cross-Origin-Opener-Policy"] == "same-origin"
 
 def test_rate_limiting():
     # Set a very low rate limit for testing
