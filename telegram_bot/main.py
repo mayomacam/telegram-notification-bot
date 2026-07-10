@@ -15,6 +15,7 @@ import platform
 from fastapi import FastAPI, HTTPException, Depends, Security, Request, Response
 from fastapi.security.api_key import APIKeyHeader
 from fastapi.responses import HTMLResponse, ORJSONResponse
+import orjson
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -39,6 +40,7 @@ CORS_ORIGINS = os.getenv("CORS_ORIGINS", "*").split(",")
 RATE_LIMIT_REQUESTS = int(os.getenv("RATE_LIMIT_REQUESTS", "100"))
 RATE_LIMIT_WINDOW = int(os.getenv("RATE_LIMIT_WINDOW", "60"))
 IP_ALLOWLIST = os.getenv("IP_ALLOWLIST", "").split(",") if os.getenv("IP_ALLOWLIST") else []
+BLOCKLIST_AGENTS = {"sqlmap", "nmap", "nikto", "dirbuster", "censys"}
 
 if not all([TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, API_SECRET_KEY]):
     logger.error("CRITICAL: Missing required environment variables (TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, API_SECRET_KEY).")
@@ -71,12 +73,16 @@ class DebugMiddleware(BaseHTTPMiddleware):
         user_agent = request.headers.get("user-agent", "unknown")
         x_forwarded_for = request.headers.get("x-forwarded-for", "none")
 
+        # Mask API Key in logs
+        api_key = request.headers.get("x-api-key") or request.query_params.get("api_key", "")
+        masked_key = api_key[:4] + "****" if len(api_key) > 4 else "****"
+
         try:
             response = await call_next(request)
             process_time = time.monotonic() - start_time
         except Exception as e:
             process_time = time.monotonic() - start_time
-            logger.error(f"Request {request.method} {request.url.path} from {request.client.host if request.client else 'unknown'} (UA: {user_agent}, XFF: {x_forwarded_for}) failed after {process_time:.4f}s: {e}")
+            logger.error(f"Request {request.method} {request.url.path} from {request.client.host if request.client else 'unknown'} (UA: {user_agent}, XFF: {x_forwarded_for}, Key: {masked_key}) failed after {process_time:.4f}s: {e}")
             raise
         finally:
             metrics.add_request_time(process_time)
@@ -85,7 +91,7 @@ class DebugMiddleware(BaseHTTPMiddleware):
         response.headers["X-Process-Time"] = f"{process_time:.4f}s"
         response.headers["X-Request-ID"] = request_id
 
-        logger.info(f"Request {request.method} {request.url.path} from {request.client.host if request.client else 'unknown'} (UA: {user_agent}, XFF: {x_forwarded_for}) processed in {process_time:.4f}s")
+        logger.info(f"Request {request.method} {request.url.path} from {request.client.host if request.client else 'unknown'} (UA: {user_agent}, XFF: {x_forwarded_for}, Key: {masked_key}) processed in {process_time:.4f}s")
         return response
 
 class SecurityHeadersMiddleware(BaseHTTPMiddleware):
@@ -93,16 +99,18 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         response = await call_next(request)
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["X-Frame-Options"] = "DENY"
-        response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+        response.headers["Strict-Transport-Security"] = "max-age=63072000; includeSubDomains; preload"
         response.headers["X-XSS-Protection"] = "0"
         response.headers["Content-Security-Policy"] = (
-            "default-src 'self'; "
+            "default-src 'none'; "
             "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
             "script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
             "img-src 'self' data:; "
+            "connect-src 'self'; "
             "frame-ancestors 'none'; "
             "base-uri 'self'; "
-            "form-action 'self';"
+            "form-action 'self'; "
+            "upgrade-insecure-requests;"
         )
         response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
         response.headers["Permissions-Policy"] = "geolocation=(), microphone=(), camera=()"
@@ -287,6 +295,14 @@ async def verify_security(
     api_key_header: Optional[str] = Security(api_key_header)
 ):
     client_ip = request.client.host if request.client else "unknown"
+    user_agent = request.headers.get("user-agent", "").lower()
+
+    # Block common scanners
+    if any(agent in user_agent for agent in BLOCKLIST_AGENTS):
+        logger.warning(f"Security Alert: Blocked request from suspicious User-Agent: {user_agent} (IP: {client_ip})")
+        metrics.security_blocks += 1
+        sentinel.log_event(client_ip, "AGENT_BLOCKED", f"Suspicious User-Agent: {user_agent}")
+        raise HTTPException(status_code=403, detail="Forbidden")
 
     if sentinel.is_blacklisted(client_ip):
         logger.warning(f"Security Alert: Blocked request from blacklisted IP {client_ip}")
@@ -351,6 +367,7 @@ async def dashboard(api_key: str = Depends(verify_security)):
         </tr>
         """
 
+    now_time = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
     html_content = f"""
     <!DOCTYPE html>
     <html lang="en" data-theme="dark">
@@ -362,33 +379,40 @@ async def dashboard(api_key: str = Depends(verify_security)):
         <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
         <style>
             :root {{
-                --pico-primary: #00d1b2;
-                --pico-primary-hover: #00b89c;
-                --pico-background-color: #0a0b10;
-                --pico-card-background-color: #14161f;
+                --pico-primary: #3fb1ff;
+                --pico-primary-hover: #2b9dec;
+                --pico-background-color: #0b0e14;
+                --pico-card-background-color: #11151c;
+                --pico-border-color: #1f242d;
             }}
-            body {{ padding: 2rem 0; background-color: var(--pico-background-color); }}
-            .status-ok {{ color: #00d1b2; }}
-            .status-err {{ color: #ff3860; font-weight: bold; }}
+            body {{ padding: 2rem 0; background-color: var(--pico-background-color); font-family: 'Inter', system-ui, -apple-system, sans-serif; }}
+            .status-ok {{ color: #3fb1ff; }}
+            .status-err {{ color: #ff4d4d; font-weight: bold; }}
             .metric-card {{
-                padding: 1.25rem;
-                border-radius: 12px;
-                border: 1px solid #232632;
+                padding: 1.5rem;
+                border-radius: 16px;
+                border: 1px solid var(--pico-border-color);
+                background: var(--pico-card-background-color);
+                box-shadow: 0 4px 20px rgba(0,0,0,0.3);
             }}
             .metric-value {{
-                font-size: 1.75rem;
+                font-size: 2rem;
                 font-weight: 800;
                 display: block;
                 margin-top: 0.5rem;
-                font-family: monospace;
+                font-family: 'JetBrains Mono', 'Fira Code', monospace;
+                letter-spacing: -1px;
             }}
             .grid {{ margin-bottom: 2rem; }}
-            header {{ margin-bottom: 3rem; border-bottom: 1px solid #232632; padding-bottom: 2rem; }}
-            table {{ font-size: 0.9rem; }}
-            mark {{ background: #232632; color: #ff3860; border: 1px solid #ff3860; }}
-            code {{ background: #1a1c27; }}
-            .progress-container {{ height: 8px; background: #232632; border-radius: 4px; margin-top: 10px; }}
-            .progress-bar {{ height: 100%; border-radius: 4px; background: var(--pico-primary); transition: width 0.5s; }}
+            header {{ margin-bottom: 3rem; border-bottom: 1px solid var(--pico-border-color); padding-bottom: 2rem; }}
+            table {{ font-size: 0.85rem; border-radius: 8px; overflow: hidden; }}
+            mark {{ background: rgba(255, 77, 77, 0.1); color: #ff4d4d; border: 1px solid rgba(255, 77, 77, 0.3); padding: 2px 6px; border-radius: 4px; }}
+            code {{ background: #1a1f29; color: #e1e1e1; }}
+            .progress-container {{ height: 6px; background: #1a1f29; border-radius: 10px; margin-top: 12px; overflow: hidden; }}
+            .progress-bar {{ height: 100%; background: linear-gradient(90deg, var(--pico-primary), #70c7ff); transition: width 0.8s cubic-bezier(0.4, 0, 0.2, 1); }}
+            .badge {{ font-size: 0.7rem; text-transform: uppercase; padding: 2px 8px; border-radius: 20px; font-weight: bold; margin-left: 8px; }}
+            .badge-live {{ background: #ff4d4d; color: white; animation: blink 2s infinite; }}
+            @keyframes blink {{ 0% {{ opacity: 1; }} 50% {{ opacity: 0.4; }} 100% {{ opacity: 1; }} }}
         </style>
     </head>
     <body>
@@ -398,6 +422,7 @@ async def dashboard(api_key: str = Depends(verify_security)):
                     <h1 style="display:flex; align-items:center; gap:10px;">
                         <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="status-ok"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path></svg>
                         SENTINEL MONITOR
+                        <span class="badge badge-live">LIVE</span>
                     </h1>
                     <p>Advanced Security Gateway • v2.2.0 • System: {sys_info}</p>
                 </hgroup>
@@ -473,9 +498,10 @@ async def dashboard(api_key: str = Depends(verify_security)):
                 </figure>
             </section>
 
-            <footer style="margin-top: 4rem; text-align: center; color: #666; padding-top: 2rem;">
+            <footer style="margin-top: 4rem; text-align: center; color: #505967; padding-top: 2rem; border-top: 1px solid var(--pico-border-color);">
                 <small>
-                    Refreshes automatically in <span id="timer">30</span>s •
+                    Last Refreshed: <strong>{now_time}</strong> •
+                    Auto-refresh in <span id="timer">30</span>s •
                     IP Allowlist: <code>{"Active" if IP_ALLOWLIST else "Disabled"}</code> •
                     Blacklisted IPs: <code>{len(sentinel.blacklist)}</code>
                 </small>
@@ -527,7 +553,9 @@ async def send_notification(
         try:
             # Fallback to raw JSON if no specific message field
             raw_json = await request.json()
-            message_text = f"<b>System Notification:</b>\n<pre>{json.dumps(raw_json, indent=2)}</pre>"
+            # Use orjson for high-performance serialization
+            formatted_json = orjson.dumps(raw_json, option=orjson.OPT_INDENT_2 | orjson.OPT_NON_STR_KEYS).decode()
+            message_text = f"<b>System Notification:</b>\n<pre>{formatted_json}</pre>"
         except Exception as e:
             logger.warning(f"Failed to parse raw JSON: {e}")
             message_text = f"<b>System Notification:</b>\n[Empty or Invalid Payload]"
@@ -557,7 +585,7 @@ async def send_notification(
     except httpx.HTTPStatusError as e:
         metrics.failed_notifications += 1
         metrics.errors += 1
-        error_body = e.response.text[:100]
+        error_body = e.response.text[:500]
         logger.error(f"Telegram API Error: Status {e.response.status_code} | Body: {error_body}...")
         raise HTTPException(status_code=502, detail=f"Upstream Telegram error: {e.response.status_code}")
     except Exception as e:

@@ -92,10 +92,26 @@ def test_security_headers():
     assert response.headers["X-Content-Type-Options"] == "nosniff"
     assert response.headers["X-Frame-Options"] == "DENY"
     assert "Strict-Transport-Security" in response.headers
+    assert "preload" in response.headers["Strict-Transport-Security"]
     assert "X-Request-ID" in response.headers
     assert "X-Process-Time" in response.headers
     assert response.headers["X-Permitted-Cross-Domain-Policies"] == "none"
     assert response.headers["Cross-Origin-Opener-Policy"] == "same-origin"
+    assert "default-src 'none'" in response.headers["Content-Security-Policy"]
+    assert "upgrade-insecure-requests" in response.headers["Content-Security-Policy"]
+
+def test_user_agent_blocking():
+    # Test blocked user agent
+    response = client.get("/dashboard", headers={"X-API-Key": "test_secret_key", "User-Agent": "sqlmap/1.4.1"})
+    assert response.status_code == 403
+
+    # Test another blocked agent
+    response = client.post("/notify", json={"message": "hi"}, headers={"X-API-Key": "test_secret_key", "User-Agent": "nmap scan"})
+    assert response.status_code == 403
+
+    # Test allowed agent
+    response = client.get("/health", headers={"User-Agent": "Mozilla/5.0"})
+    assert response.status_code == 200
 
 def test_rate_limiting():
     # Set a very low rate limit for testing
